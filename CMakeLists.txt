@@ -11,8 +11,8 @@ endif()
 project(vitaspeed)
 include("$ENV{VITASDK}/share/vita.cmake" REQUIRED)
 
-set(VITA_APP_NAME "Vita Speedtest")
-set(VITA_TITLEID  "VSPD00001")
+set(VITA_APP_NAME "Speedtest")
+set(VITA_TITLEID  "JAJTIC001")
 set(VITA_VERSION  "01.00")
 
 add_executable(${PROJECT_NAME} src/main.cpp)
