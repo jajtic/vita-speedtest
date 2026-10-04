@@ -32,11 +32,12 @@ volatile uint64_t testStart = 0;
 volatile int iperfState = 0;
 volatile int iperfStage = 0;
 volatile int iperfPhase = 0;   // 1 = handshaking, 2 = sending, 3 = finishing
+volatile int iperfReverse = 0;   // 0 = upload (we send), 1 = download (we receive)
 
 volatile uint64_t iperfBytes = 0;
 volatile uint64_t iperfStart = 0;
 volatile double iperfSpeed = 0;
-volatile double iperfRecvSpeed = 0;   // receiver's Mbps from the server's results
+volatile double iperfPeerSpeed = 0;   // peer's Mbps from the server's results JSON
 
 volatile int iperfLog[IPERF_LOG_MAX];
 volatile int iperfLogCount = 0;
@@ -132,10 +133,14 @@ int iperfHandshake() {
     if (b1 == -1000) { iperfStage = 5; goto fail; }
     iperfLogPush(b1);
 
+    // NOTE: the server treats the PRESENCE of "reverse" as true (its bool check
+    // accepts false too), so the key must be omitted for upload - never sent as
+    // false. The real client only adds it when reverse is on.
     snprintf(json, sizeof(json),
         "{\"tcp\":true,\"omit\":0,\"time\":10,\"num\":0,\"blockcount\":0,"
         "\"parallel\":1,\"len\":131072,\"pacing_timer\":1000,"
-        "\"client_version\":\"3.21\"}");
+        "%s\"client_version\":\"3.21\"}",
+        iperfReverse ? "\"reverse\":true," : "");
 
     if (sendJson(iperfCtrl, json) != 0) { iperfStage = 6; goto fail; }
 
@@ -172,12 +177,29 @@ void iperfRunTest() {
     uint64_t now = start;
     int ok = 1;
 
-    while (now - start < (uint64_t)IPERF_TIME_SEC * 1000000ULL && !stopRequested) {
-        int n = sceNetSend(iperfData, sendBuf, sizeof(sendBuf), 0);
-        if (n < 0) { ok = 0; break; }
-        total += n;
-        iperfBytes += n;
-        now = sceKernelGetProcessTimeWide();
+    if (!iperfReverse) {
+        while (now - start < (uint64_t)IPERF_TIME_SEC * 1000000ULL && !stopRequested) {
+            int n = sceNetSend(iperfData, sendBuf, sizeof(sendBuf), 0);
+            if (n < 0) { ok = 0; break; }
+            total += n;
+            iperfBytes += n;
+            now = sceKernelGetProcessTimeWide();
+        }
+    }
+    else {
+        // Download (reverse): the server sends, we receive. A short receive
+        // timeout on the data socket keeps the last recv (after the server
+        // stops) from blocking forever - a negative return just re-checks the
+        // clock. now must refresh every pass, timeouts included.
+        int timeout_us = 500 * 1000;   // 500 ms
+        sceNetSetsockopt(iperfData, SCE_NET_SOL_SOCKET, SCE_NET_SO_RCVTIMEO, &timeout_us, sizeof(timeout_us));
+
+        while (now - start < (uint64_t)IPERF_TIME_SEC * 1000000ULL && !stopRequested) {
+            int n = sceNetRecv(iperfData, sendBuf, sizeof(sendBuf), 0);
+            if (n > 0) { total += n; iperfBytes += n; }
+            else if (n == 0) { ok = 0; break; }
+            now = sceKernelGetProcessTimeWide();
+        }
     }
 
     double seconds = (now - start) / 1000000.0;
@@ -213,7 +235,7 @@ void iperfRunTest() {
                 if (t) recvSecs = strtod(t + 11, NULL);
                 if (recvSecs <= 0) recvSecs = seconds;
                 if (recvBytes > 0 && recvSecs > 0)
-                    iperfRecvSpeed = recvBytes * 8 / recvSecs / 1000000.0;
+                    iperfPeerSpeed = recvBytes * 8 / recvSecs / 1000000.0;
 
                 int b2 = recvStateByte(iperfCtrl);
                 if (b2 != -1000) iperfLogPush(b2);
@@ -230,7 +252,7 @@ void iperfRunTest() {
 int iperfThread(SceSize args, void *argp) {
     iperfBytes = 0;
     iperfSpeed = 0;
-    iperfRecvSpeed = 0;
+    iperfPeerSpeed = 0;
     iperfPhase = 1;
     if (iperfHandshake() == 0) {
         iperfPhase = 2;
@@ -396,28 +418,32 @@ void drawIperf(vita2d_pgf *font) {
     sceNetCtlInetGetState(&state);
     vita2d_pgf_draw_text(font, 50, 100, RGBA8(255, 255, 255, 255), 1, "iperf3 Speedtest");
     vita2d_pgf_draw_textf(font, 50, 140, RGBA8(180, 180, 180, 255), 1, "Server: %s:%d", IPERF_SERVER_IP, IPERF_PORT);
+    vita2d_pgf_draw_textf(font, 50, 180, RGBA8(180, 180, 180, 255), 1, "Mode: %s (Square to change)",
+                    iperfReverse ? "Download" : "Upload");
 
     if (iperfState == 1) {
         if (iperfPhase == 1) {
-            vita2d_pgf_draw_text(font, 50, 180, RGBA8(255, 255, 255, 255), 1, "Handshaking...");
+            vita2d_pgf_draw_text(font, 50, 220, RGBA8(255, 255, 255, 255), 1, "Handshaking...");
         }
         else if (iperfPhase == 2) {
-            vita2d_pgf_draw_text(font, 50, 180, RGBA8(255, 255, 255, 255), 1, "Sending...");
+            vita2d_pgf_draw_text(font, 50, 220, RGBA8(255, 255, 255, 255), 1,
+                            iperfReverse ? "Receiving..." : "Sending...");
             uint64_t bytes = iperfBytes;
             if (bytes > 0) {
                 double secs = (sceKernelGetProcessTimeWide() - iperfStart) / 1000000.0;
                 if (secs > 0)
-                    vita2d_pgf_draw_textf(font, 50, 220, RGBA8(0, 255, 0, 255), 1,
-                                    "Upload: %.1f Mbps", bytes * 8 / secs / 1000000.0);
+                    vita2d_pgf_draw_textf(font, 50, 260, RGBA8(0, 255, 0, 255), 1,
+                                    iperfReverse ? "Download: %.1f Mbps" : "Upload: %.1f Mbps",
+                                    bytes * 8 / secs / 1000000.0);
             }
         }
         else {
-            vita2d_pgf_draw_text(font, 50, 180, RGBA8(255, 255, 255, 255), 1, "Finishing...");
+            vita2d_pgf_draw_text(font, 50, 220, RGBA8(255, 255, 255, 255), 1, "Finishing...");
         }
     }
     else if (iperfState == 2) {
         if (iperfStage != 0) {
-            vita2d_pgf_draw_textf(font, 50, 180, RGBA8(255, 80, 80, 255), 1,
+            vita2d_pgf_draw_textf(font, 50, 220, RGBA8(255, 80, 80, 255), 1,
                             "Local failure at stage %d", iperfStage);
         }
 
@@ -425,25 +451,25 @@ void drawIperf(vita2d_pgf *font) {
         int off = snprintf(line, sizeof(line), "States:");
         for (int i = 0; i < iperfLogCount && off < (int)sizeof(line); i++)
             off += snprintf(line + off, sizeof(line) - off, " %d", (int)iperfLog[i]);
-        vita2d_pgf_draw_text(font, 50, 220, RGBA8(255, 255, 255, 255), 1, line);
+        vita2d_pgf_draw_text(font, 50, 260, RGBA8(255, 255, 255, 255), 1, line);
 
         int last = (iperfLogCount > 0) ? iperfLog[iperfLogCount - 1] : -1;
         if (last == 14)
-            vita2d_pgf_draw_text(font, 50, 260, RGBA8(0, 255, 0, 255), 1, "DISPLAY_RESULTS - done");
+            vita2d_pgf_draw_text(font, 50, 300, RGBA8(0, 255, 0, 255), 1, "DISPLAY_RESULTS - done");
         else if (last == 13)
-            vita2d_pgf_draw_text(font, 50, 260, RGBA8(255, 200, 0, 255), 1, "EXCHANGE_RESULTS");
+            vita2d_pgf_draw_text(font, 50, 300, RGBA8(255, 200, 0, 255), 1, "EXCHANGE_RESULTS");
         else if (last == 2)
-            vita2d_pgf_draw_text(font, 50, 260, RGBA8(255, 200, 0, 255), 1, "TEST_RUNNING");
+            vita2d_pgf_draw_text(font, 50, 300, RGBA8(255, 200, 0, 255), 1, "TEST_RUNNING");
 
         if (iperfSpeed > 0)
-            vita2d_pgf_draw_textf(font, 50, 300, RGBA8(0, 255, 0, 255), 1,
-                            "Upload: %.1f Mbps", iperfSpeed);
-        if (iperfRecvSpeed > 0)
             vita2d_pgf_draw_textf(font, 50, 340, RGBA8(0, 255, 0, 255), 1,
-                            "Receiver: %.1f Mbps", iperfRecvSpeed);
+                            iperfReverse ? "Download: %.1f Mbps" : "Upload: %.1f Mbps", iperfSpeed);
+        if (iperfPeerSpeed > 0)
+            vita2d_pgf_draw_textf(font, 50, 380, RGBA8(0, 255, 0, 255), 1,
+                            iperfReverse ? "Server sent: %.1f Mbps" : "Receiver: %.1f Mbps", iperfPeerSpeed);
     }
     else {
-        vita2d_pgf_draw_text(font, 50, 180, RGBA8(255, 255, 255, 255), 1, "Press X to start handshake.");
+        vita2d_pgf_draw_text(font, 50, 220, RGBA8(255, 255, 255, 255), 1, "Press X to start handshake.");
     }
 }
 
@@ -492,6 +518,9 @@ int main() {
         }
         else {
             if (pressed & SCE_CTRL_CIRCLE) chosen = -1;
+            // Toggle upload/download mode on the iperf screen (only when idle).
+            if (chosen == 1 && (pressed & SCE_CTRL_SQUARE) && iperfState != 1)
+                iperfReverse = !iperfReverse;
             if (chosen == 1 && (pressed & SCE_CTRL_CROSS) && iperfState != 1) {
                 sceNetCtlInetGetState(&state);
                 iperfStage = 0;
