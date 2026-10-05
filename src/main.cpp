@@ -5,6 +5,7 @@
 #include <psp2/sysmodule.h>
 #include <psp2/net/net.h>
 #include <psp2/net/netctl.h>
+#include <psp2/io/stat.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,12 +33,21 @@ volatile int rampDone = 0;
 
 #define RAMP_MS 2000
 
-#define IPERF_SERVER_IP "192.168.1.11"
+#define CONNECT_TIMEOUT_MS 4000
+#define LATENCY_CONNECT_TIMEOUT_MS 2000
+
 #define IPERF_PORT 5201
 #define COOKIE_SIZE_BYTES 37
 #define IPERF_LOG_MAX 8
 #define IPERF_TIME_SEC 10
 #define IPERF_BLKSIZE 131072
+
+#define CONFIG_DIR       "ux0:data/vitaspeed"
+#define CONFIG_PATH      "ux0:data/vitaspeed/config.txt"
+#define DEFAULT_IPERF_IP "192.168.1.11"
+
+char iperfServerIp[32] = DEFAULT_IPERF_IP;
+int  configStatus = 0;   // 0 = default, 1 = loaded, 2 = bad IP in file, 3 = can't write
 
 volatile int iperfState = 0;
 volatile int iperfStage = 0;
@@ -110,6 +120,15 @@ static int recvJson(int sock, char *buf, int bufSize) {
     return 0;
 }
 
+static int connectWithTimeout(int sock, const SceNetSockaddr *addr, unsigned int addrlen, int timeout_ms) {
+    int t = timeout_ms * 1000;
+    sceNetSetsockopt(sock, SCE_NET_SOL_SOCKET, SCE_NET_SO_SNDTIMEO, &t, sizeof(t));
+    int r = sceNetConnect(sock, addr, addrlen);
+    int restore = 60 * 1000 * 1000;
+    sceNetSetsockopt(sock, SCE_NET_SOL_SOCKET, SCE_NET_SO_SNDTIMEO, &restore, sizeof(restore));
+    return (r < 0) ? -1 : 0;
+}
+
 int iperfHandshake() {
     SceNetInAddr ip;
     SceNetSockaddrIn addr;
@@ -120,7 +139,7 @@ int iperfHandshake() {
     if (iperfData >= 0) { sceNetSocketClose(iperfData); iperfData = -1; }
     iperfLogCount = 0;
 
-    if (sceNetInetPton(SCE_NET_AF_INET, IPERF_SERVER_IP, &ip) <= 0) { iperfStage = 1; return -1; }
+    if (sceNetInetPton(SCE_NET_AF_INET, iperfServerIp, &ip) <= 0) { iperfStage = 1; return -1; }
 
     iperfCtrl = sceNetSocket("iperf-ctl", SCE_NET_AF_INET, SCE_NET_SOCK_STREAM, 0);
     if (iperfCtrl < 0) { iperfStage = 2; return -1; }
@@ -130,7 +149,7 @@ int iperfHandshake() {
     addr.sin_port = sceNetHtons(IPERF_PORT);
     addr.sin_addr = ip;
 
-    if (sceNetConnect(iperfCtrl, (SceNetSockaddr *)&addr, sizeof(addr)) < 0) { iperfStage = 3; goto fail; }
+    if (connectWithTimeout(iperfCtrl, (SceNetSockaddr *)&addr, sizeof(addr), CONNECT_TIMEOUT_MS) < 0) { iperfStage = 3; goto fail; }
 
     timeout_us = 5 * 1000 * 1000;   // 5 seconds
     sceNetSetsockopt(iperfCtrl, SCE_NET_SOL_SOCKET, SCE_NET_SO_RCVTIMEO, &timeout_us, sizeof(timeout_us));
@@ -146,26 +165,26 @@ int iperfHandshake() {
     // accepts false too), so the key must be omitted for upload - never sent as
     // false. The real client only adds it when reverse is on.
     snprintf(json, sizeof(json),
-        "{\"tcp\":true,\"omit\":0,\"time\":10,\"num\":0,\"blockcount\":0,"
+        "{\"tcp\":true,\"omit\":0,\"time\":%d,\"num\":0,\"blockcount\":0,"
         "\"parallel\":1,\"len\":131072,\"pacing_timer\":1000,"
         "%s\"client_version\":\"3.21\"}",
-        iperfReverse ? "\"reverse\":true," : "");
+        IPERF_TIME_SEC, iperfReverse ? "\"reverse\":true," : "");
 
     if (sendJson(iperfCtrl, json) != 0) { iperfStage = 6; goto fail; }
 
     b2 = recvStateByte(iperfCtrl);
-    if (b2 == -1000) { iperfStage = 8; goto fail; }
+    if (b2 == -1000) { iperfStage = 7; goto fail; }
     iperfLogPush(b2);
 
     iperfData = sceNetSocket("iperf-data", SCE_NET_AF_INET, SCE_NET_SOCK_STREAM, 0);
-    if (iperfData < 0) { iperfStage = 9; goto fail; }
+    if (iperfData < 0) { iperfStage = 8; goto fail; }
     sceNetSetsockopt(iperfData, SCE_NET_SOL_SOCKET, SCE_NET_SO_RCVBUF, &kRcvBufBytes, sizeof(kRcvBufBytes));
-    if (sceNetConnect(iperfData, (SceNetSockaddr *)&addr, sizeof(addr)) < 0) { iperfStage = 9; goto fail; }
-    if (sceNetSend(iperfData, iperfCookie, COOKIE_SIZE_BYTES, 0) != COOKIE_SIZE_BYTES) { iperfStage = 10; goto fail; }
+    if (connectWithTimeout(iperfData, (SceNetSockaddr *)&addr, sizeof(addr), CONNECT_TIMEOUT_MS) < 0) { iperfStage = 8; goto fail; }
+    if (sceNetSend(iperfData, iperfCookie, COOKIE_SIZE_BYTES, 0) != COOKIE_SIZE_BYTES) { iperfStage = 9; goto fail; }
 
     for (i = 0; i < 4; i++) {
         b = recvStateByte(iperfCtrl);
-        if (b == -1000) { iperfStage = 11; goto fail; }
+        if (b == -1000) { iperfStage = 10; goto fail; }
         iperfLogPush(b);
         if (b == 2) break;
     }
@@ -231,10 +250,10 @@ void iperfRunTest() {
                 (unsigned long long)total);
 
             if (sendJson(iperfCtrl, res) != 0) {
-                iperfStage = 12;
+                iperfStage = 11;   // could not send our results
             }
             else if (recvJson(iperfCtrl, resultBuf, sizeof(resultBuf)) != 0) {
-                iperfStage = 13;
+                iperfStage = 12;   // could not read the server's results
             }
             else {
                 unsigned long long recvBytes = 0;
@@ -317,7 +336,7 @@ int dlWorker(SceSize args, void *argp) {
     addr.sin_port = sceNetHtons(80);
     addr.sin_addr = dlIp;
 
-    if (sceNetConnect(sock, (SceNetSockaddr *)&addr, sizeof(addr)) < 0) {
+    if (connectWithTimeout(sock, (SceNetSockaddr *)&addr, sizeof(addr), CONNECT_TIMEOUT_MS) < 0) {
         sceNetSocketClose(sock);
         dlDone[idx] = 1;
         return sceKernelExitDeleteThread(0);
@@ -431,7 +450,7 @@ int measureLatency() {
     sceNetInetPton(SCE_NET_AF_INET, "1.1.1.1", &addr.sin_addr);
 
     uint64_t start = sceKernelGetProcessTimeWide();
-    int ret = sceNetConnect(sock, (SceNetSockaddr *)&addr, sizeof(addr));
+    int ret = connectWithTimeout(sock, (SceNetSockaddr *)&addr, sizeof(addr), LATENCY_CONNECT_TIMEOUT_MS);
     uint64_t end = sceKernelGetProcessTimeWide();
 
     sceNetSocketClose(sock);
@@ -441,19 +460,21 @@ int measureLatency() {
 }
 
 void getAvgLatency(int testcount, int &min, int &avg, int &max) {
-    int latency;
     int latencysum = 0;
+    int ok = 0;
     min = 1000000000;
     max = 0;
-    for (int i = 0; i<testcount; i++) {
+    for (int i = 0; i < testcount; i++) {
         if (stopRequested) break;
-        latency = measureLatency();
+        int latency = measureLatency();
+        if (latency < 0) continue;
         latencysum += latency;
+        ok++;
         if (latency > max) max = latency;
         if (latency < min) min = latency;
-
     }
-    avg = latencysum/testcount;
+    if (ok == 0) { min = -1; avg = -1; max = -1; return; }
+    avg = latencysum / ok;
 }
 
 int testThread(SceSize args, void *argp) {
@@ -535,7 +556,12 @@ void drawInternet(vita2d_pgf *font) {
 void drawIperf(vita2d_pgf *font) {
     sceNetCtlInetGetState(&state);
     vita2d_pgf_draw_text(font, 50, 100, RGBA8(255, 255, 255, 255), 1, "iperf3 Speedtest");
-    vita2d_pgf_draw_textf(font, 50, 140, RGBA8(180, 180, 180, 255), 1, "Server: %s:%d", IPERF_SERVER_IP, IPERF_PORT);
+    const char *src = configStatus == 1 ? "config"
+                    : configStatus == 2 ? "config invalid, using default"
+                    : configStatus == 3 ? "can't write config"
+                    :                     "default";
+    vita2d_pgf_draw_textf(font, 50, 140, RGBA8(180, 180, 180, 255), 1,
+                    "Server: %s:%d (%s)", iperfServerIp, IPERF_PORT, src);
     vita2d_pgf_draw_textf(font, 50, 180, RGBA8(180, 180, 180, 255), 1, "Mode: %s (Square to change)",
                     iperfReverse ? "Download" : "Upload");
 
@@ -591,6 +617,33 @@ void drawIperf(vita2d_pgf *font) {
     }
 }
 
+static void loadConfig() {
+    FILE *f = fopen(CONFIG_PATH, "r");
+    if (!f) {
+        sceIoMkdir(CONFIG_DIR, 0777);
+        f = fopen(CONFIG_PATH, "w");
+        if (f) { fprintf(f, "%s\n", DEFAULT_IPERF_IP); fclose(f); configStatus = 0; }
+        else configStatus = 3;
+        return;
+    }
+
+    char line[64];
+    configStatus = 2;
+    if (fgets(line, sizeof(line), f)) {
+        size_t n = strlen(line);
+        while (n > 0 && (line[n-1] == '\n' || line[n-1] == '\r' || line[n-1] == ' '))
+            line[--n] = '\0';
+
+        SceNetInAddr test;
+        if (n > 0 && n < sizeof(iperfServerIp) &&
+            sceNetInetPton(SCE_NET_AF_INET, line, &test) > 0) {
+            strcpy(iperfServerIp, line);
+            configStatus = 1;
+        }
+    }
+    fclose(f);
+}
+
 int main() {
     vita2d_init();
     vita2d_set_clear_color(RGBA8(0, 0, 0, 255));
@@ -603,6 +656,8 @@ int main() {
     param.flags = 0;
     sceNetInit(&param);
     sceNetCtlInit();
+
+    loadConfig();
 
     sceNetCtlInetGetState(&state);
 
@@ -658,17 +713,21 @@ int main() {
         vita2d_swap_buffers();
     }
     stopRequested = 1;
-    while (testState == 1 || iperfState == 1) {
+    uint64_t exitDeadline = sceKernelGetProcessTimeWide() + 8 * 1000000ULL;   // 8 s max
+    while ((testState == 1 || iperfState == 1) && sceKernelGetProcessTimeWide() < exitDeadline) {
         sceKernelDelayThread(10 * 1000); // 10 ms
     }
-    if (iperfData >= 0) { sceNetSocketClose(iperfData); iperfData = -1; }
-    if (iperfCtrl >= 0) { sceNetSocketClose(iperfCtrl); iperfCtrl = -1; }
-    sceNetCtlTerm();
-    sceNetTerm();
-    sceSysmoduleUnloadModule(SCE_SYSMODULE_NET);
-    vita2d_wait_rendering_done();
-    vita2d_free_pgf(font);
-    vita2d_fini();
+
+    if (testState != 1 && iperfState != 1) {
+        if (iperfData >= 0) { sceNetSocketClose(iperfData); iperfData = -1; }
+        if (iperfCtrl >= 0) { sceNetSocketClose(iperfCtrl); iperfCtrl = -1; }
+        sceNetCtlTerm();
+        sceNetTerm();
+        sceSysmoduleUnloadModule(SCE_SYSMODULE_NET);
+        vita2d_wait_rendering_done();
+        vita2d_free_pgf(font);
+        vita2d_fini();
+    }
     sceKernelExitProcess(0);
     return 0;
 }
