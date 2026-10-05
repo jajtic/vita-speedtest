@@ -9,6 +9,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+static const int kRcvBufBytes = 512 * 1024;
+
 int selected = 0;
 int chosen = -1;
 int state;
@@ -17,10 +19,18 @@ int dnsResult = 0;
 double speed = 0;
 int failStage = 0;
 int avgLatency = 0, minLatency = 0, maxLatency = 0;
+int rcvBufSetRet = 0;
+int rcvBufGetRet = 0;
+int rcvBufEff = 0;
 volatile int testState = 0;
 volatile int stopRequested = 0;
 volatile uint64_t bytesSoFar;
 volatile uint64_t testStart = 0;
+volatile uint64_t rampBaseBytes = 0;
+volatile uint64_t rampBaseTime = 0;
+volatile int rampDone = 0;
+
+#define RAMP_MS 2000
 
 #define IPERF_SERVER_IP "192.168.1.11"
 #define IPERF_PORT 5201
@@ -32,12 +42,12 @@ volatile uint64_t testStart = 0;
 volatile int iperfState = 0;
 volatile int iperfStage = 0;
 volatile int iperfPhase = 0;   // 1 = handshaking, 2 = sending, 3 = finishing
-volatile int iperfReverse = 0;   // 0 = upload (we send), 1 = download (we receive)
+volatile int iperfReverse = 0;   // 0 = upload, 1 = download
 
 volatile uint64_t iperfBytes = 0;
 volatile uint64_t iperfStart = 0;
 volatile double iperfSpeed = 0;
-volatile double iperfPeerSpeed = 0;   // peer's Mbps from the server's results JSON
+volatile double iperfPeerSpeed = 0;
 
 volatile int iperfLog[IPERF_LOG_MAX];
 volatile int iperfLogCount = 0;
@@ -49,7 +59,6 @@ static char iperfCookie[COOKIE_SIZE_BYTES];
 
 static char sendBuf[IPERF_BLKSIZE];
 
-// Holds the server's results JSON (never trust a network length past this).
 static char resultBuf[4096];
 
 static void iperfLogPush(int b) {
@@ -150,6 +159,7 @@ int iperfHandshake() {
 
     iperfData = sceNetSocket("iperf-data", SCE_NET_AF_INET, SCE_NET_SOCK_STREAM, 0);
     if (iperfData < 0) { iperfStage = 9; goto fail; }
+    sceNetSetsockopt(iperfData, SCE_NET_SOL_SOCKET, SCE_NET_SO_RCVBUF, &kRcvBufBytes, sizeof(kRcvBufBytes));
     if (sceNetConnect(iperfData, (SceNetSockaddr *)&addr, sizeof(addr)) < 0) { iperfStage = 9; goto fail; }
     if (sceNetSend(iperfData, iperfCookie, COOKIE_SIZE_BYTES, 0) != COOKIE_SIZE_BYTES) { iperfStage = 10; goto fail; }
 
@@ -275,51 +285,139 @@ int resolveHost(const char *name, SceNetInAddr *out) {
     return 0;
 }
 
-double downloadTest() {
-    SceNetInAddr ip;
-    if (resolveHost("speedtest.belwue.net", &ip) != 0) { failStage = 1; return -1; }
+#define MAX_STREAMS 4
+static const char *kDlHost = "speedtest.belwue.net";
+static const char *kDlPath = "/100M";
+static char dlBuf[MAX_STREAMS][32 * 1024];
+volatile uint32_t dlBytes[MAX_STREAMS];
+volatile int dlDone[MAX_STREAMS];
+volatile uint64_t dlDeadline = 0;
+static SceNetInAddr dlIp;
+volatile int dlStreams = 3;
 
-    int sock = sceNetSocket("latency", SCE_NET_AF_INET, SCE_NET_SOCK_STREAM, 0);
-    if (sock < 0) { failStage = 2; return -1; }
+int dlWorker(SceSize args, void *argp) {
+    int idx = *(int *)argp;
+    if (idx < 0 || idx >= MAX_STREAMS) return sceKernelExitDeleteThread(0);
+
+    int sock = sceNetSocket("dl", SCE_NET_AF_INET, SCE_NET_SOCK_STREAM, 0);
+    if (sock < 0) { dlDone[idx] = 1; return sceKernelExitDeleteThread(0); }
+
+    int sret = sceNetSetsockopt(sock, SCE_NET_SOL_SOCKET, SCE_NET_SO_RCVBUF, &kRcvBufBytes, sizeof(kRcvBufBytes));
+    int eff = 0;
+    unsigned int elen = sizeof(eff);
+    int gret = sceNetGetsockopt(sock, SCE_NET_SOL_SOCKET, SCE_NET_SO_RCVBUF, &eff, &elen);
+    if (idx == 0) { rcvBufSetRet = sret; rcvBufGetRet = gret; rcvBufEff = eff; }
+
+    int timeout_us = 500 * 1000;
+    sceNetSetsockopt(sock, SCE_NET_SOL_SOCKET, SCE_NET_SO_RCVTIMEO, &timeout_us, sizeof(timeout_us));
 
     SceNetSockaddrIn addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = SCE_NET_AF_INET;
     addr.sin_port = sceNetHtons(80);
-    addr.sin_addr = ip;
+    addr.sin_addr = dlIp;
 
     if (sceNetConnect(sock, (SceNetSockaddr *)&addr, sizeof(addr)) < 0) {
-        failStage = 3;
         sceNetSocketClose(sock);
-        return -1;
+        dlDone[idx] = 1;
+        return sceKernelExitDeleteThread(0);
     }
 
-    const char *req = "GET /100M HTTP/1.1\r\nHost: speedtest.belwue.net\r\nConnection: close\r\n\r\n";
+    char req[256];
+    snprintf(req, sizeof(req),
+             "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", kDlPath, kDlHost);
     if (sceNetSend(sock, req, strlen(req), 0) < 0) {
-        failStage = 4;
         sceNetSocketClose(sock);
-        return -1;
+        dlDone[idx] = 1;
+        return sceKernelExitDeleteThread(0);
     }
 
-    static char buf[64 * 1024];
-    uint64_t total = 0;
-    uint64_t start = sceKernelGetProcessTimeWide();
-    testStart = start;
-    uint64_t now = start;
-
-    while (now - start < 10000000 && !stopRequested) {
-        int n = sceNetRecv(sock, buf, sizeof(buf), 0);
-        if (n <= 0) break;
-        total += n;
-        bytesSoFar += n;
+    uint64_t now = sceKernelGetProcessTimeWide();
+    while (now < dlDeadline && !stopRequested) {
+        int n = sceNetRecv(sock, dlBuf[idx], sizeof(dlBuf[idx]), 0);
+        if (n > 0) dlBytes[idx] += n;
+        else if (n == 0) break;
         now = sceKernelGetProcessTimeWide();
     }
 
     sceNetSocketClose(sock);
-    double seconds = (now - start) / 1000000.0;
+    dlDone[idx] = 1;
+    return sceKernelExitDeleteThread(0);
+}
 
-    if (total == 0 || seconds <= 0) { failStage = 5; return -1; }
-    return total * 8 / seconds / 1000000.0;
+double downloadTest() {
+    if (resolveHost(kDlHost, &dlIp) != 0) { failStage = 1; return -1; }
+
+    int n = dlStreams;
+    if (n < 1) n = 1;
+    if (n > MAX_STREAMS) n = MAX_STREAMS;
+
+    for (int i = 0; i < MAX_STREAMS; i++) { dlBytes[i] = 0; dlDone[i] = 0; }
+
+    uint64_t start = sceKernelGetProcessTimeWide();
+    testStart = start;
+    rampBaseBytes = 0;
+    rampBaseTime = start;
+    rampDone = 0;
+    bytesSoFar = 0;
+    dlDeadline = start + 10000000ULL;   // 10 s
+
+    SceUID startedThreads[MAX_STREAMS];
+    int startedIdx[MAX_STREAMS];
+    int started = 0;
+    for (int i = 0; i < n; i++) {
+        SceUID th = sceKernelCreateThread("dl", dlWorker, 0x10000100, 0x10000, 0, 0, NULL);
+        if (th < 0) continue;
+        int idx = i;
+        if (sceKernelStartThread(th, sizeof(idx), &idx) == 0) {
+            startedThreads[started] = th;
+            startedIdx[started] = i;
+            started++;
+        } else {
+            sceKernelDeleteThread(th);
+        }
+    }
+    if (started == 0) { failStage = 2; return -1; }
+
+    while (sceKernelGetProcessTimeWide() < dlDeadline && !stopRequested) {
+        uint64_t sum = 0;
+        for (int i = 0; i < MAX_STREAMS; i++) sum += dlBytes[i];
+        bytesSoFar = sum;
+
+        uint64_t now = sceKernelGetProcessTimeWide();
+        if (!rampDone && now - start >= (uint64_t)RAMP_MS * 1000) {
+            rampBaseBytes = sum;
+            rampBaseTime = now;
+            rampDone = 1;
+        }
+
+        int alldone = 1;
+        for (int i = 0; i < started; i++) if (!dlDone[startedIdx[i]]) { alldone = 0; break; }
+        if (alldone) break;
+
+        sceKernelDelayThread(100 * 1000);   // 100 ms
+    }
+    uint64_t end = sceKernelGetProcessTimeWide();
+
+    for (int i = 0; i < started; i++)
+        sceKernelWaitThreadEnd(startedThreads[i], NULL, NULL);
+
+    uint64_t total = 0;
+    for (int i = 0; i < MAX_STREAMS; i++) total += dlBytes[i];
+    bytesSoFar = total;
+
+    uint64_t bytes;
+    double seconds;
+    if (rampDone && end - rampBaseTime >= 1000000ULL) {
+        bytes = total - rampBaseBytes;
+        seconds = (end - rampBaseTime) / 1000000.0;
+    } else {
+        bytes = total;
+        seconds = (end - start) / 1000000.0;
+    }
+
+    if (bytes == 0 || seconds <= 0) { failStage = 5; return -1; }
+    return bytes * 8 / seconds / 1000000.0;
 }
 
 int measureLatency() {
@@ -360,10 +458,21 @@ void getAvgLatency(int testcount, int &min, int &avg, int &max) {
 
 int testThread(SceSize args, void *argp) {
     bytesSoFar = 0;
+    rampDone = 0;
     getAvgLatency(5, minLatency, avgLatency, maxLatency);
     speed = downloadTest();
     testState = 2;
     return sceKernelExitDeleteThread(0);
+}
+
+static void startInternetTest() {
+    sceNetCtlInetGetState(&state);
+    if (testState != 1) {
+        testState = 1;
+        SceUID thid = sceKernelCreateThread("test", testThread, 0x10000100, 0x10000, 0, 0, NULL);
+        if (thid >= 0) sceKernelStartThread(thid, 0, NULL);
+        else testState = 0;
+    }
 }
 
 void drawMenu(vita2d_pgf *font) {
@@ -387,9 +496,11 @@ void drawInternet(vita2d_pgf *font) {
         vita2d_pgf_draw_text(font, 50, 140, RGBA8(255, 255, 255, 255), 1, "Running...");
 
         uint64_t bytes = bytesSoFar;
-        if (bytes > 0) {
-            double secs = (sceKernelGetProcessTimeWide() - testStart) / 1000000.0;
-            if (secs > 0) vita2d_pgf_draw_textf(font, 50, 180, RGBA8(255, 255, 255, 255), 1, "Measuring: %.1f Mbps", bytes * 8 / secs / 1000000.0);
+        uint64_t baseBytes = 0, baseTime = testStart;
+        if (rampDone) { baseBytes = rampBaseBytes; baseTime = rampBaseTime; }
+        if (bytes > baseBytes) {
+            double secs = (sceKernelGetProcessTimeWide() - baseTime) / 1000000.0;
+            if (secs > 0) vita2d_pgf_draw_textf(font, 50, 180, RGBA8(255, 255, 255, 255), 1, "Measuring: %.1f Mbps", (bytes - baseBytes) * 8 / secs / 1000000.0);
         }
     }
     else if (testState == 2) {
@@ -408,9 +519,16 @@ void drawInternet(vita2d_pgf *font) {
         }
         vita2d_pgf_draw_textf(font, 50, 220, RGBA8(255,255,255,255), 1,
                         "Fail stage: %d, DNS code: 0x%08X", failStage, (unsigned int)dnsResult);
+        vita2d_pgf_draw_textf(font, 50, 260, RGBA8(200, 200, 200, 255), 1,
+                        "RCVBUF want %d KB, got %d KB (set=%d get=%d)",
+                        kRcvBufBytes / 1024, rcvBufEff / 1024, rcvBufSetRet, rcvBufGetRet);
+        vita2d_pgf_draw_textf(font, 50, 300, RGBA8(180, 180, 180, 255), 1,
+                        "Streams: %d (L/R to change, X to re-run)", dlStreams);
     }
     else {
         vita2d_pgf_draw_text(font, 50, 140, RGBA8(255, 255, 255, 255), 1, "Test is idle.");
+        vita2d_pgf_draw_textf(font, 50, 180, RGBA8(180, 180, 180, 255), 1,
+                        "Streams: %d (L/R to change)", dlStreams);
     }
 }
 
@@ -505,20 +623,16 @@ int main() {
             if (pressed & SCE_CTRL_DOWN) selected = 1;
             if (pressed & SCE_CTRL_CROSS) {
                 chosen = selected;
-                if (chosen == 0) {
-                    sceNetCtlInetGetState(&state);
-                    if (testState != 1) {
-                        testState = 1;
-                        SceUID thid = sceKernelCreateThread("test", testThread, 0x10000100, 0x10000, 0, 0, NULL);
-                        if (thid >= 0) sceKernelStartThread(thid, 0, NULL);
-                        else testState = 0;
-                    }
-                }
+                if (chosen == 0) startInternetTest();
             }
         }
         else {
             if (pressed & SCE_CTRL_CIRCLE) chosen = -1;
-            // Toggle upload/download mode on the iperf screen (only when idle).
+            if (chosen == 0 && testState != 1) {
+                if ((pressed & SCE_CTRL_LTRIGGER) && dlStreams > 1) dlStreams--;
+                if ((pressed & SCE_CTRL_RTRIGGER) && dlStreams < MAX_STREAMS) dlStreams++;
+                if (pressed & SCE_CTRL_CROSS) startInternetTest();
+            }
             if (chosen == 1 && (pressed & SCE_CTRL_SQUARE) && iperfState != 1)
                 iperfReverse = !iperfReverse;
             if (chosen == 1 && (pressed & SCE_CTRL_CROSS) && iperfState != 1) {
