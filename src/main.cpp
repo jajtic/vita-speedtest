@@ -938,7 +938,7 @@ int main() {
                             "Wi-Fi: %s ch %d signal %d%% IP %s", wifi.ssid, wifi.channel, wifi.rssiPct, wifi.ip);
         else
             vita2d_pgf_draw_text(font, 10, 536, RGBA8(200, 120, 120, 255), 0.9f, "Not connected");
-        vita2d_pgf_draw_text(font, 890, 536, RGBA8(180, 180, 180, 255), 1, "@jajtic");
+        vita2d_pgf_draw_text(font, 825, 536, RGBA8(180, 180, 180, 255), 1, "v1.0 - @jajtic");
         vita2d_end_drawing();
         vita2d_swap_buffers();
     }
